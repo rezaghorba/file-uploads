@@ -195,10 +195,33 @@ def handle_social_links(message):
     processing_msg = bot.send_message(chat_id, "⏳ در حال پردازش و دانلود رسانه...", reply_to_message_id=reply_to)
 
     try:
-        # مدیریت توییتر با استفاده از تبدیل به دامنه پایدار vxtwitter در بستر آزادِ Render
+        # مدیریت اختصاصی توییتر (ایکس) با استفاده از API پایدار در بستر رندر
         if 'twitter.com' in url or 'x.com' in url:
-            url = url.replace('x.com', 'vxtwitter.com').replace('twitter.com', 'vxtwitter.com')
+            tweet_id = url.split('/')[-1].split('?')[0]
+            api_url = f"https://api.vxtwitter.com/Twitter/status/{tweet_id}"
+            resp = requests.get(api_url, timeout=20).json()
+            
+            if 'media_extended' in resp and len(resp['media_extended']) > 0:
+                media_url = resp['media_extended'][0]['url']
+                video_data = requests.get(media_url, timeout=30).content
+                filename = f"twitter_{chat_id}_{message_id}.mp4"
+                
+                with open(filename, 'wb') as f:
+                    f.write(video_data)
+                
+                social_captions[filename] = resp.get('text', 'توییتر / ایکس 🐦')
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("مشاهده کپشن 📋", callback_data=f"show_cap_{filename}"))
 
+                with open(filename, 'rb') as f:
+                    bot.send_video(chat_id, f, caption="✨✨", reply_to_message_id=message_id, reply_markup=markup)
+
+                if os.path.exists(filename):
+                    os.remove(filename)
+                bot.delete_message(chat_id, processing_msg.message_id)
+                return
+
+        # پردازش اینستاگرام و یوتیوب با yt-dlp
         output_template = f"media_{chat_id}_{message_id}.%(ext)s"
         ydl_opts = {
             'outtmpl': output_template,
@@ -240,6 +263,7 @@ def handle_social_links(message):
             bot.edit_message_text("❌ دانلود از این لینک با خطا مواجه شد.", chat_id, processing_msg.message_id)
         except:
             pass
+
 
 # هندلر نمایش کپشن
 @bot.callback_query_handler(func=lambda call: call.data.startswith('show_cap_'))
