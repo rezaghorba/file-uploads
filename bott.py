@@ -29,7 +29,7 @@ from telebot.types import (
 
 # ================= CONFIG =================
 
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY")
 
 if not TOKEN:
     raise RuntimeError("TOKEN environment variable is missing")
