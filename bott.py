@@ -8,6 +8,8 @@ import telebot
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReactionTypeEmoji
 import yt_dlp
 
+# (بقیه متغیرها و کدهای بالای فایل سر جای خودشان هستند...)
+
 # توکن ربات
 TOKEN = "9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY"
 
@@ -291,6 +293,132 @@ def handle_social_links(message):
     except Exception:
       pass
 
+  reply_to = message_id if is_group else None
+  processing_msg = bot.send_message(
+      chat_id,
+      "⏳ در حال پردازش و دانلود رسانه...",
+      reply_to_message_id=reply_to,
+  )
+
+  try:
+    output_template = f"media_{chat_id}_{message_id}.%(ext)s"
+    ydl_opts = {
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "geo_bypass": True,
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+    }
+
+    if "instagram.com" in url and os.path.exists("cookies.txt"):
+      ydl_opts["cookiefile"] = "cookies.txt"
+
+    filename = None
+    original_caption = "کپشنی موجود نیست."
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+      try:
+        info = ydl.extract_info(url, download=True)
+        if "entries" in info:
+          info = info["entries"][0]
+        filename = ydl.prepare_filename(info)
+        original_caption = info.get("description", "کپشنی موجود نیست.")
+      except Exception as yt_err:
+        # اگر خطا از نوع ویدیو نبود، بررسی می‌کنیم که آیا لینک عکس مستقیم است یا خیر
+        print(f"YT-DLP Error (Maybe photo): {yt_err}")
+
+      # اگر فایل به صورت خودکار دانلود نشد، احتمالاً پست عکس است؛ لینک تصویر را استخراج می‌کنیم
+      if not filename or not os.path.exists(filename):
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl_flat:
+          meta = ydl_flat.extract_info(url, download=False)
+          if "entries" in meta:
+            meta = meta["entries"][0]
+
+          image_url = meta.get("url") or meta.get("thumbnail")
+          if image_url:
+            res = requests.get(image_url)
+            if res.status_code == 200:
+              filename = f"media_{chat_id}_{message_id}.jpg"
+              with open(filename, "wb") as img_file:
+                img_file.write(res.content)
+              original_caption = meta.get(
+                  "description", "کپشنی موجود نیست."
+              )
+
+    if not filename or not os.path.exists(filename):
+      # تلاش نهایی برای پیدا کردن هر فایل با نام مشابه در پوشه
+      base_name = f"media_{chat_id}_{message_id}"
+      for file in os.listdir("."):
+        if file.startswith(base_name):
+          filename = file
+          break
+
+    if not filename or not os.path.exists(filename):
+      raise Exception("File not downloaded")
+
+    social_captions[filename] = original_caption
+
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton(
+            "مشاهده کپشن 📋", callback_data=f"show_cap_{filename}"
+        )
+    )
+
+    with open(filename, "rb") as f:
+      if filename.endswith((".mp4", ".mkv", ".webm", ".mov", ".gif")):
+        bot.send_video(
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=markup,
+        )
+      elif filename.endswith(
+          (".jpg", ".jpeg", ".png", ".webp", ".jfif", ".heic")
+      ):
+        bot.send_photo(
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=markup,
+        )
+      else:
+        bot.send_document(
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=markup,
+        )
+
+    if os.path.exists(filename):
+      os.remove(filename)
+
+    bot.delete_message(chat_id, processing_msg.message_id)
+
+  except Exception as e:
+    print(f"Error: {e}")
+    try:
+      bot.edit_message_text(
+          "❌ دانلود از این لینک با خطا مواجه شد.",
+          chat_id,
+          processing_msg.message_id,
+      )
+    except:
+      pass
   reply_to = message_id if is_group else None
   processing_msg = bot.send_message(
       chat_id,
