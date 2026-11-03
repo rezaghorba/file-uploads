@@ -32,7 +32,7 @@ from telebot.types import (
 TOKEN = os.getenv("9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY")
 
 if not TOKEN:
-    raise RuntimeError("TOKEN environment variable is missing")
+    raise RuntimeError("9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY")
 
 ADMIN_IDS = [
     7904239647,
