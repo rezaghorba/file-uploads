@@ -275,6 +275,7 @@ def process_caption(message):
 )
 def handle_social_links(message):
   url = message.text.strip()
+  print(f"DEBUG: Received URL -> {url}")
 
   if "instagram.com" in url:
     url = url.split("?")[0]
@@ -291,6 +292,134 @@ def handle_social_links(message):
     except Exception:
       pass
 
+  reply_to = message_id if is_group else None
+  processing_msg = bot.send_message(
+      chat_id,
+      "⏳ در حال پردازش و استخراج رسانه...",
+      reply_to_message_id=reply_to,
+  )
+
+  try:
+    ydl_opts = {
+        "noplaylist": True,
+        "quiet": False,  # موقتاً برای دیدن جزئیات در لاگ
+        "no_warnings": False,
+        "skip_download": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+    }
+
+    if "instagram.com" in url and os.path.exists("cookies.txt"):
+      ydl_opts["cookiefile"] = "cookies.txt"
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+      info = ydl.extract_info(url, download=False)
+      if "entries" in info:
+        info = info["entries"][0]
+
+      print(f"DEBUG: Extracted info keys -> {list(info.keys())}")
+      original_caption = info.get("description", "کپشنی موجود نیست.")
+
+      media_url = info.get("url")
+      if not media_url and "formats" in info and info["formats"]:
+        media_url = info["formats"][-1].get("url")
+      if not media_url:
+        media_url = info.get("thumbnail")
+
+      print(f"DEBUG: Resolved media_url -> {media_url}")
+
+      if not media_url:
+        raise Exception("Media URL not found in extracted info")
+
+      ext = "jpg"
+      if any(
+          img_ext in media_url.lower() for img_ext in [".jpg", ".png", ".webp"]
+      ):
+        ext = "jpg"
+      elif info.get("ext") in ["mp4", "mkv", "webm", "mov"]:
+        ext = info.get("ext")
+
+      filename = f"media_{chat_id}_{message_id}.{ext}"
+
+      res = requests.get(
+          media_url,
+          headers={
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              )
+          },
+          stream=True,
+          timeout=30,
+      )
+      print(f"DEBUG: Requests status code -> {res.status_code}")
+
+      if res.status_code == 200:
+        with open(filename, "wb") as f:
+          for chunk in res.iter_content(chunk_size=8192):
+            f.write(chunk)
+      else:
+        raise Exception(f"Failed to download, status code: {res.status_code}")
+
+    social_captions[filename] = original_caption
+
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton(
+            "مشاهده کپشن 📋", callback_data=f"show_cap_{filename}"
+        )
+    )
+
+    with open(filename, "rb") as f:
+      if filename.endswith((".mp4", ".mkv", ".webm", ".mov", ".gif")):
+        bot.send_video(
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=markup,
+        )
+      elif filename.endswith(
+          (".jpg", ".jpeg", ".png", ".webp", ".jfif", ".heic")
+      ):
+        bot.send_photo(
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=markup,
+        )
+      else:
+        bot.send_document(
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=markup,
+        )
+
+    if os.path.exists(filename):
+      os.remove(filename)
+
+    bot.delete_message(chat_id, processing_msg.message_id)
+
+  except Exception as e:
+    print(f"CRITICAL ERROR in handle_social_links: {e}")
+    try:
+      bot.edit_message_text(
+          f"❌ خطا در پردازش: {str(e)[:100]}",
+          chat_id,
+          processing_msg.message_id,
+      )
+    except:
+      pass
   reply_to = message_id if is_group else None
   processing_msg = bot.send_message(
       chat_id,
