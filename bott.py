@@ -259,7 +259,7 @@ def process_caption(message):
   )
 
 
-# هندلر هوشمند لینک‌های شبکه‌های اجتماعی (اینستاگرام، یوتیوب، توییتر)
+# هندلر هوشمند لینک‌های شبکه‌های اجتماعی (اینستاگرام، یوتیوب، توییتر) برای عکس و فیلم
 @bot.message_handler(
     func=lambda message: message.text
     and any(
@@ -275,6 +275,11 @@ def process_caption(message):
 )
 def handle_social_links(message):
   url = message.text.strip()
+
+  # پاکسازی پارامترهای اضافی از لینک اینستاگرام
+  if "instagram.com" in url:
+    url = url.split("?")[0]
+
   chat_id = message.chat.id
   message_id = message.message_id
   is_group = message.chat.type in ["group", "supergroup"]
@@ -296,9 +301,10 @@ def handle_social_links(message):
 
   try:
     output_template = f"media_{chat_id}_{message_id}.%(ext)s"
+
+    # تنظیمات منعطف برای دانلود هم عکس و هم ویدیو بدون خطای فرمت
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "best,bestvideo+bestaudio/best",
         "noplaylist": True,
         "socket_timeout": 30,
         "geo_bypass": True,
@@ -314,6 +320,7 @@ def handle_social_links(message):
       filename = ydl.prepare_filename(info)
       original_caption = info.get("description", "کپشنی موجود نیست.")
 
+      # بررسی هوشمند فایل دانلود شده (چه ویدیو و چه عکس تکی/آلبوم)
       if not os.path.exists(filename):
         base_name = f"media_{chat_id}_{message_id}"
         for file in os.listdir("."):
@@ -331,7 +338,7 @@ def handle_social_links(message):
     )
 
     with open(filename, "rb") as f:
-      if filename.endswith((".mp4", ".mkv", ".webm", ".mov")):
+      if filename.endswith((".mp4", ".mkv", ".webm", ".mov", ".gif")):
         bot.send_video(
             chat_id,
             f,
@@ -339,7 +346,9 @@ def handle_social_links(message):
             reply_to_message_id=reply_to,
             reply_markup=markup,
         )
-      elif filename.endswith((".jpg", ".jpeg", ".png", ".webp")):
+      elif filename.endswith(
+          (".jpg", ".jpeg", ".png", ".webp", ".jfif", ".heic")
+      ):
         bot.send_photo(
             chat_id,
             f,
