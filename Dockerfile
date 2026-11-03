@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1.7
+
+FROM denoland/deno:2.9.8 AS deno
+
+FROM python:3.14-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV TZ=UTC \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+      gcc \
+      build-essential \
+      libffi-dev \
+      libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv "$VIRTUAL_ENV"
+
+COPY requirements.txt ./
+
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv pip install --python "$VIRTUAL_ENV/bin/python" -r requirements.txt
+
+FROM python:3.14-slim
+# Pin to a digest for reproducible builds:
+#   docker pull python:3.14-slim && docker inspect --format='{{index .RepoDigests 0}}' python:3.14-slim
+#   Then use: FROM python:3.14-slim@sha256:...
+
+ENV TZ=UTC \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --system appgroup \
+    && adduser --system --ingroup appgroup --home /app appuser
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=deno /usr/bin/deno /usr/local/bin/deno
+COPY . .
+
+RUN mkdir -p /app/downloads /app/logs /app/cookies && \
+    chown -R appuser:appgroup /app
+
+ENTRYPOINT ["python", "container_entrypoint.py"]
+CMD ["python", "main.py"]

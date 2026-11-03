@@ -1,0 +1,410 @@
+import asyncio
+import hashlib
+import os
+import time
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import httpx
+from aiocron import crontab
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.enums.parse_mode import ParseMode
+from aiogram_dialog import setup_dialogs
+from sqlalchemy import insert as sql_insert
+
+from app_context import set_app_context
+from config import (
+    API_SECRET,
+    BOT_COMMANDS,
+    BOT_POLLING_TASKS_CONCURRENCY_LIMIT,
+    BOT_SESSION_CONNECTION_LIMIT,
+    BOT_TOKEN,
+    CUSTOM_API_URL,
+    MEASUREMENT_ID,
+    OUTPUT_DIR,
+)
+from services.download.queue import shutdown_download_queue
+from services.logger import logger as logging
+from services.runtime.analytics_status import record_drop as record_analytics_drop
+from services.storage.db import AnalyticsEvent, DataBase
+from utils.download_manager import close_download_http_clients
+from utils.http_client import close_http_session
+
+logging = logging.bind(service="main")
+
+_HEARTBEAT_PATH = "/tmp/bot_heartbeat"
+
+
+async def _heartbeat_loop():
+    while True:
+        try:
+            with open(_HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+                f.write(str(time.time()))
+        except Exception as exc:
+            logging.debug("Heartbeat write failed: %s", exc)
+        await asyncio.sleep(15)
+
+
+@dataclass(slots=True)
+class _AnalyticsPayload:
+    user_id: int
+    chat_type: str
+    action_name: str
+
+
+@dataclass(slots=True)
+class Application:
+    session: AiohttpSession
+    bot: Bot
+    dispatcher: Dispatcher
+    db: DataBase
+
+
+def create_app(
+    *,
+    bot_token: str = BOT_TOKEN,
+    api_url: str = CUSTOM_API_URL,
+    database_factory: Callable[[], DataBase] = DataBase,
+    session_timeout: int = 600,
+    session_limit: int = BOT_SESSION_CONNECTION_LIMIT,
+) -> Application:
+    session = AiohttpSession(
+        limit=max(1, int(session_limit)),
+        api=TelegramAPIServer.from_base(api_url),
+        timeout=session_timeout,
+    )
+    default = DefaultBotProperties(parse_mode=ParseMode.HTML)
+    bot = Bot(token=bot_token, default=default, session=session)
+    dispatcher = Dispatcher()
+    db = database_factory()
+    os.makedirs("downloads", exist_ok=True)
+    return Application(
+        session=session,
+        bot=bot,
+        dispatcher=dispatcher,
+        db=db,
+    )
+
+
+_app = create_app()
+session = _app.session
+bot = _app.bot
+dp = _app.dispatcher
+db = _app.db
+
+
+_ANALYTICS_QUEUE_MAXSIZE = 2048
+_ANALYTICS_WORKERS = 2
+_ANALYTICS_BATCH_SIZE = 25
+_ANALYTICS_BATCH_TIMEOUT = 0.5
+_ANALYTICS_SEND_CONCURRENCY = 8
+
+_analytics_queue: Optional[asyncio.Queue[Optional[_AnalyticsPayload]]] = None
+_analytics_worker_tasks: list[asyncio.Task] = []
+_analytics_http_client: Optional[httpx.AsyncClient] = None
+_analytics_http_client_lock = asyncio.Lock()
+
+
+async def _get_analytics_http_client() -> httpx.AsyncClient:
+    global _analytics_http_client
+    if _analytics_http_client is not None:
+        return _analytics_http_client
+
+    async with _analytics_http_client_lock:
+        if _analytics_http_client is None:
+            _analytics_http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+                limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
+            )
+        return _analytics_http_client
+
+
+async def _close_analytics_http_client() -> None:
+    global _analytics_http_client
+    if _analytics_http_client is not None:
+        try:
+            await _analytics_http_client.aclose()
+        except Exception as error:  # pragma: no cover - defensive close
+            logging.debug("Failed to close analytics HTTP client: %s", error)
+    _analytics_http_client = None
+
+
+def _build_analytics_identity(user_id: int) -> tuple[str, str, str]:
+    salt = f"{BOT_TOKEN}:{MEASUREMENT_ID or 'ga'}"
+    digest = hashlib.sha256(f"{salt}:{int(user_id)}".encode("utf-8")).hexdigest()
+    client_id = digest
+    user_identifier = digest[:32]
+    session_id = str(int(digest[:16], 16))
+    return client_id, user_identifier, session_id
+
+
+async def _send_to_google_analytics(payload: _AnalyticsPayload) -> None:
+    if not MEASUREMENT_ID or not API_SECRET:
+        return
+
+    client_id, user_identifier, session_id = _build_analytics_identity(payload.user_id)
+    params = {
+        "client_id": client_id,
+        "user_id": user_identifier,
+        "events": [
+            {
+                "name": payload.action_name,
+                "params": {
+                    "chat_type": payload.chat_type,
+                    "session_id": session_id,
+                    "engagement_time_msec": "1000",
+                },
+            }
+        ],
+    }
+
+    client = await _get_analytics_http_client()
+    await client.post(
+        f"https://www.google-analytics.com/mp/collect?measurement_id={MEASUREMENT_ID}&api_secret={API_SECRET}",
+        json=params,
+        timeout=10,
+    )
+
+
+async def _persist_analytics_batch(batch: list[_AnalyticsPayload]) -> None:
+    if not batch:
+        return
+
+    rows = [
+        {"user_id": p.user_id, "chat_type": p.chat_type, "action_name": p.action_name}
+        for p in batch
+    ]
+
+    async with db.SessionLocal() as db_session:
+        await db_session.execute(sql_insert(AnalyticsEvent), rows)
+        await db_session.commit()
+
+
+async def _flush_analytics_batch(batch: list[_AnalyticsPayload]) -> None:
+    if not batch:
+        return
+
+    started_at = asyncio.get_running_loop().time()
+
+    semaphore = asyncio.Semaphore(max(1, _ANALYTICS_SEND_CONCURRENCY))
+
+    async def _send_payload(payload: _AnalyticsPayload) -> None:
+        async with semaphore:
+            try:
+                await _send_to_google_analytics(payload)
+            except Exception as error:
+                logging.debug(
+                    "Failed to send analytics to GA: user_id=%s action=%s error=%s",
+                    payload.user_id,
+                    payload.action_name,
+                    error,
+                )
+
+    await asyncio.gather(*(_send_payload(payload) for payload in batch))
+
+    await _persist_analytics_batch(batch)
+    logging.perf(
+        "analytics_batch_flush",
+        duration_ms=(asyncio.get_running_loop().time() - started_at) * 1000.0,
+        batch_size=len(batch),
+    )
+
+
+async def _analytics_worker(worker_id: int) -> None:
+    queue = _analytics_queue
+    if queue is None:
+        return
+
+    with logging.context(
+        flow="analytics_worker", request_id=f"analytics-worker-{worker_id}"
+    ):
+        loop = asyncio.get_running_loop()
+        while True:
+            item = await queue.get()
+            if item is None:
+                queue.task_done()
+                break
+
+            batch = [item]
+            stop_requested = False
+            deadline = loop.time() + _ANALYTICS_BATCH_TIMEOUT
+
+            while len(batch) < _ANALYTICS_BATCH_SIZE:
+                timeout = deadline - loop.time()
+                if timeout <= 0:
+                    break
+                try:
+                    next_item = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    break
+
+                if next_item is None:
+                    stop_requested = True
+                    queue.task_done()
+                    break
+
+                batch.append(next_item)
+
+            try:
+                await _flush_analytics_batch(batch)
+            except Exception as error:
+                logging.error(
+                    "Analytics worker failed: worker=%s error=%s", worker_id, error
+                )
+            finally:
+                for _ in batch:
+                    queue.task_done()
+
+            if stop_requested:
+                break
+
+
+async def start_analytics_workers() -> None:
+    global _analytics_queue, _analytics_worker_tasks
+    if _analytics_queue is not None and _analytics_worker_tasks:
+        return
+
+    _analytics_queue = asyncio.Queue(maxsize=_ANALYTICS_QUEUE_MAXSIZE)
+    _analytics_worker_tasks = [
+        asyncio.create_task(_analytics_worker(idx), name=f"analytics-worker-{idx}")
+        for idx in range(_ANALYTICS_WORKERS)
+    ]
+    logging.event("analytics_workers_started", count=_ANALYTICS_WORKERS)
+
+
+async def stop_analytics_workers() -> None:
+    global _analytics_queue, _analytics_worker_tasks
+    queue = _analytics_queue
+    if queue is not None:
+        await queue.join()
+        for _ in _analytics_worker_tasks:
+            queue.put_nowait(None)
+        if _analytics_worker_tasks:
+            await asyncio.gather(*_analytics_worker_tasks, return_exceptions=True)
+
+    _analytics_worker_tasks = []
+    _analytics_queue = None
+    await _close_analytics_http_client()
+
+
+async def send_analytics(user_id, chat_type, action_name):
+    try:
+        payload = _AnalyticsPayload(
+            user_id=user_id,
+            chat_type=chat_type.value
+            if hasattr(chat_type, "value")
+            else str(chat_type),
+            action_name=action_name,
+        )
+
+        queue = _analytics_queue
+        if queue is not None:
+            try:
+                queue.put_nowait(payload)
+                return
+            except asyncio.QueueFull:
+                record_analytics_drop()
+                logging.warning(
+                    "Analytics queue is full, dropping event: user_id=%s action=%s",
+                    user_id,
+                    action_name,
+                )
+                logging.event(
+                    "analytics_dropped",
+                    level=30,
+                    user_id=user_id,
+                    chat_type=payload.chat_type,
+                    action_name=action_name,
+                )
+                return
+
+        await _flush_analytics_batch([payload])
+    except Exception as error:
+        logging.error(
+            "Failed to record analytics event: action=%s user_id=%s error=%s",
+            action_name,
+            user_id,
+            error,
+        )
+
+
+async def main():
+    analytics_started = False
+    with logging.context(flow="startup", request_id="bot-startup"):
+        try:
+            startup_started_at = asyncio.get_running_loop().time()
+            bot_me = await bot.get_me()
+            bot_id = getattr(bot_me, "id", "-")
+            logging.info("[STARTUP] Bot starting up: @%s (ID: %s)", bot_me.username, bot_id)
+            logging.event("bot_startup", bot_username=bot_me.username)
+            set_app_context(bot=bot, db=db, send_analytics=send_analytics)
+            await db.init_db()
+            logging.info("[STARTUP] Database initialized successfully")
+            await start_analytics_workers()
+            analytics_started = True
+
+            import handlers
+            import middlewares
+            from handlers.admin import clear_downloads_and_notify
+
+            if not os.path.exists(OUTPUT_DIR):
+                os.makedirs(OUTPUT_DIR)
+
+            dp.include_router(handlers.router)
+
+            for middleware_cls in middlewares.__all__:
+                middleware = middleware_cls()
+                dp.message.outer_middleware(middleware)
+                dp.callback_query.outer_middleware(middleware)
+                dp.inline_query.outer_middleware(middleware)
+                dp.guest_message.outer_middleware(middleware)
+
+            setup_dialogs(dp)
+
+            await bot.set_my_commands(commands=BOT_COMMANDS)
+            await bot.delete_webhook(drop_pending_updates=True)
+
+            crontab("0 0 * * *", func=clear_downloads_and_notify, start=True)
+
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
+            logging.perf(
+                "bot_startup_duration",
+                duration_ms=(asyncio.get_running_loop().time() - startup_started_at)
+                * 1000.0,
+                bot_username=bot_me.username,
+            )
+            logging.event("polling_started")
+            logging.info("[STARTUP] Bot started successfully. Listening for updates...")
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                tasks_concurrency_limit=max(
+                    1, int(BOT_POLLING_TASKS_CONCURRENCY_LIMIT)
+                ),
+            )
+        finally:
+            logging.info("[SHUTDOWN] Bot shutting down...")
+            logging.event("polling_stopping")
+            if "heartbeat_task" in locals():
+                heartbeat_task.cancel()
+            if analytics_started:
+                with suppress(Exception):
+                    await stop_analytics_workers()
+            with suppress(Exception):
+                await shutdown_download_queue()
+            with suppress(Exception):
+                close_download_http_clients()
+            with suppress(Exception):
+                await close_http_session()
+            with suppress(Exception):
+                await session.close()
+            with suppress(Exception):
+                await db.engine.dispose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
