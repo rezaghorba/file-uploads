@@ -4,7 +4,7 @@ import telebot
 import yt_dlp
 
 # توکن بات شما
-TOKEN = 'YOUR_BOT_TOKEN_HERE'
+TOKEN = '9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY'
 
 bot = telebot.TeleBot(TOKEN)
 
