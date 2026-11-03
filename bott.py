@@ -299,7 +299,7 @@ def handle_social_links(message):
     output_template = f"media_{chat_id}_{message_id}.%(ext)s"
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "best",
+        "format": "best,bestvideo+bestaudio/best",
         "noplaylist": True,
         "socket_timeout": 30,
         "geo_bypass": True,
@@ -312,8 +312,19 @@ def handle_social_links(message):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
       info = ydl.extract_info(url, download=True)
+
+      # اگر پست آلبوم (چندرسانه‌ای) باشد یا تکی باشد، فایل دانلودی را پیدا می‌کنیم
       filename = ydl.prepare_filename(info)
       original_caption = info.get("description", "کپشنی موجود نیست.")
+
+      # بررسی اینکه آیا فایل دانلود شده یا نه (گاهی پسوند متفاوت است)
+      if not os.path.exists(filename):
+        # تلاش برای پیدا کردن فایلی که با نام مشابه ذخیره شده است
+        base_name = f"media_{chat_id}_{message_id}"
+        for file in os.listdir("."):
+          if file.startswith(base_name):
+            filename = file
+            break
 
     social_captions[filename] = original_caption
 
@@ -359,7 +370,8 @@ def handle_social_links(message):
     print(f"Error: {e}")
     try:
       bot.edit_message_text(
-          "❌ دانلود از این لینک با خطا مواجه شد.",
+          "❌ دانلود از این لینک با خطا مواجه شد. (ممکن است پست خصوصی باشد یا"
+          " نیاز به cookies.txt داشته باشد)",
           chat_id,
           processing_msg.message_id,
       )
@@ -379,7 +391,7 @@ def callback_show_caption(call):
 
 if __name__ == "__main__":
   print("Bot is running...")
-  while True:
+  while `True`:
     try:
       bot.infinity_polling(timeout=10, long_polling_timeout=5)
     except Exception:
