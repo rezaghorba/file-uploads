@@ -5,7 +5,6 @@ import yt_dlp
 
 # توکن بات شما
 TOKEN = '9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY'
-
 bot = telebot.TeleBot(TOKEN)
 
 # رجکس برای تشخیص لینک توییتر (ایکس)
