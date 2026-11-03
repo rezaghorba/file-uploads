@@ -259,7 +259,7 @@ def process_caption(message):
   )
 
 
-# هندلر هوشمند لینک‌های شبکه‌های اجتماعی برای عکس و ویدیو
+# هندلر هوشمند لینک‌های شبکه‌های اجتماعی (متد استخراج هوشمند لینک مستقیم)
 @bot.message_handler(
     func=lambda message: message.text
     and any(
@@ -294,19 +294,16 @@ def handle_social_links(message):
   reply_to = message_id if is_group else None
   processing_msg = bot.send_message(
       chat_id,
-      "⏳ در حال پردازش و دانلود رسانه...",
+      "⏳ در حال پردازش و استخراج رسانه...",
       reply_to_message_id=reply_to,
   )
 
   try:
-    output_template = f"media_{chat_id}_{message_id}.%(ext)s"
     ydl_opts = {
-        "outtmpl": output_template,
         "noplaylist": True,
-        "socket_timeout": 30,
-        "geo_bypass": True,
         "quiet": True,
         "no_warnings": True,
+        "skip_download": True,  # عدم دانلود مستقیم توسط yt-dlp برای جلوگیری از خطا
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -322,67 +319,59 @@ def handle_social_links(message):
     if "instagram.com" in url and os.path.exists("cookies.txt"):
       ydl_opts["cookiefile"] = "cookies.txt"
 
-    filename = None
-    original_caption = "کپشنی موجود نیست."
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+      info = ydl.extract_info(url, download=False)
+      if "entries" in info:
+        info = info["entries"][0]
 
-    # تلاش اول: استخراج به عنوان ویدیو یا اطلاعات کلی
-    try:
-      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info:
-          info = info["entries"][0]
-        filename = ydl.prepare_filename(info)
-        original_caption = info.get("description", "کپشنی موجود نیست.")
-    except Exception:
-      pass
+      original_caption = info.get("description", "کپشنی موجود نیست.")
 
-    # تلاش دوم: اگر فایل دانلود نشده باشد (چون پست عکس است)، لینک تصویر مستقیم استخراج می‌شود
-    if not filename or not os.path.exists(filename):
-      try:
-        flat_opts = {"quiet": True, "skip_download": True}
-        if "instagram.com" in url and os.path.exists("cookies.txt"):
-          flat_opts["cookiefile"] = "cookies.txt"
+      # استخراج لینک مستقیم رسانه (چه عکس، چه ویدیو)
+      media_url = info.get("url")
+      if not media_url and "formats" in info and info["formats"]:
+        # انتخاب بهترین فرمت موجود
+        media_url = info["formats"][-1].get("url")
+      if not media_url:
+        media_url = info.get("thumbnail")
 
-        with yt_dlp.YoutubeDL(flat_opts) as ydl_flat:
-          meta = ydl_flat.extract_info(url, download=False)
-          if "entries" in meta:
-            meta = meta["entries"][0]
+      if not media_url:
+        raise Exception("Media URL not found")
 
-          # پیدا کردن لینک مستقیم عکس یا تامبنیل
-          img_url = meta.get("url") or meta.get("thumbnail")
-          if not img_url and "formats" in meta:
-            img_url = meta["formats"][-1].get("url")
+      # تشخیص پسوند فایل بر اساس لینک یا نوع محتوا
+      ext = "mp4"
+      if info.get("ext") in [
+          "jpg",
+          "jpeg",
+          "png",
+          "webp",
+          "jfif",
+          "heic",
+      ] or any(
+          img_ext in media_url.lower() for img_ext in [".jpg", ".png", ".webp"]
+      ):
+        ext = "jpg"
+      elif info.get("ext"):
+        ext = info.get("ext")
 
-          if img_url:
-            r = requests.get(
-                img_url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                        " AppleWebKit/537.36"
-                    )
-                },
-            )
-            if r.status_code == 200:
-              filename = f"media_{chat_id}_{message_id}.jpg"
-              with open(filename, "wb") as f_img:
-                f_img.write(r.content)
-              original_caption = meta.get(
-                  "description", "کپشنی موجود نیست."
+      filename = f"media_{chat_id}_{message_id}.{ext}"
+
+      # دانلود فایل با استفاده از requests به صورت امن
+      res = requests.get(
+          media_url,
+          headers={
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
               )
-      except Exception as img_err:
-        print(f"Image extraction error: {img_err}")
-
-    # تلاش سوم: جستجوی عمومی فایل ذخیره شده با پیشوند مشخص
-    if not filename or not os.path.exists(filename):
-      base_name = f"media_{chat_id}_{message_id}"
-      for file in os.listdir("."):
-        if file.startswith(base_name):
-          filename = file
-          break
-
-    if not filename or not os.path.exists(filename):
-      raise Exception("Could not download media file.")
+          },
+          stream=True,
+          timeout=30,
+      )
+      if res.status_code == 200:
+        with open(filename, "wb") as f:
+          for chunk in res.iter_content(chunk_size=8192):
+            f.write(chunk)
+      else:
+        raise Exception("Failed to download media content")
 
     social_captions[filename] = original_caption
 
