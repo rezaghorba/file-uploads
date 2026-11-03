@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -o errexit
 
-# نصب کامپایلر Rust برای پکیج‌های نیازمند بیلد (مثل pydantic-core)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-export PATH="$HOME/.cargo/bin:$PATH"
+# اضافه کردن مسیر Rustِ موجود در سرور رندر به متغیرهای محیطی
+export PATH="/usr/local/cargo/bin:$PATH"
 
-# آپدیت کردن ابزارهای پایتون
+# آپدیت ابزارهای پایتون
 pip install --upgrade pip setuptools wheel
 
-# نصب کتابخانه‌های پروژه
+# نصب پکیج‌ها
 pip install -r requirements.txt
