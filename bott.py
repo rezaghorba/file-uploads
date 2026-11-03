@@ -622,29 +622,10 @@ SOCIAL_DOMAINS = [
     func=lambda m: m.text and any(d in m.text for d in SOCIAL_DOMAINS)
 )
 def handle_social_links(message):
-  m = re.search(r"https?://\S+", message.text)
-  if not m:
-    return
-  url = m.group(0).strip()
-  if "instagram.com" in url:
-    url = url.split("?")[0]
-
-  chat_id = message.chat.id
-  message_id = message.message_id
-  is_group = message.chat.type in ["group", "supergroup"]
-  reply_to = message_id if is_group else None
-
-  if is_group:
-    try:
-      bot.set_message_reaction(chat_id, message_id, [ReactionTypeEmoji("👀")])
-    except Exception:
-      pass
-
-  processing_msg = bot.send_message(
-      chat_id,
-      "⏳ در حال پردازش و استخراج رسانه...",
-      reply_to_message_id=reply_to,
-  )
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    print(f"DOWNLOAD ERROR: {type(e).__name__}: {e}")
 
   workdir = tempfile.mkdtemp(prefix="dl_")
   try:
