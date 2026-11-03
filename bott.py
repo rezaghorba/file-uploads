@@ -10,6 +10,9 @@ import tempfile
 import threading
 import time
 import uuid
+from html import unescape
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import requests
 import telebot
@@ -68,7 +71,7 @@ social_captions = {}
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.5"}
 
@@ -279,7 +282,135 @@ def process_caption(message):
   )
 
 
-# ======================= دانلودر شبکه‌های اجتماعی =======================
+# ======================= کلاس دانلودر اینستاگرام =======================
+
+
+class InstagramDownloader:
+
+  TIMEOUT = 20
+
+  def download(self, url):
+    html_content = self._fetch_html(url)
+    media = self._parse_json(html_content)
+    if not media:
+      media = self._parse_og_meta(html_content)
+    if not media:
+      raise Exception("Could not extract media from this post.")
+    return media
+
+  def _is_valid_url(self, url):
+    pattern = (
+        r"^https?://(www\.)?instagram\.com/(p|reel|tv)/[a-zA-Z0-9_-]+/?(\?.*)?"
+    )
+    return bool(re.match(pattern, url))
+
+  def _fetch_html(self, url):
+    headers = {
+        "User-Agent": UA,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    request = Request(url, headers=headers)
+    try:
+      with urlopen(request, timeout=self.TIMEOUT) as response:
+        return response.read().decode("utf-8")
+    except HTTPError as e:
+      raise Exception(f"HTTP error: {e.code}")
+    except URLError as e:
+      raise Exception(f"Network error: {e.reason}")
+
+  def _parse_json(self, html):
+    match = re.search(
+        r'__additionalDataLoaded\s*\(\s*["\'].*?["\']\s*,\s*(\{.*?\})\s*\)',
+        html,
+        re.DOTALL,
+    )
+    if match:
+      try:
+        data = json.loads(match.group(1))
+        node = data.get("graphql", {}).get("shortcode_media", {})
+        if node:
+          return self._media_from_graphql_node(node)
+      except Exception:
+        pass
+
+    match_ld = re.search(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if match_ld:
+      try:
+        data = json.loads(match_ld.group(1))
+        if isinstance(data, list):
+          data = data[0]
+        video_url = data.get("video", [{}])
+        if isinstance(video_url, list) and video_url:
+          return {
+              "type": "video",
+              "url": video_url[0].get("contentUrl", ""),
+              "thumbnail": data.get("thumbnailUrl", ""),
+          }
+        else:
+          image = data.get("image")
+          if image:
+            return {
+                "type": "image",
+                "url": image if isinstance(image, str) else image[0],
+            }
+      except Exception:
+        pass
+    return None
+
+  def _media_from_graphql_node(self, node):
+    typename = node.get("__typename", "")
+    if typename == "GraphVideo" or node.get("is_video"):
+      video_url = node.get("video_url", "")
+      if video_url:
+        return {
+            "type": "video",
+            "url": video_url,
+            "thumbnail": node.get("display_url")
+            or node.get("thumbnail_src", ""),
+        }
+    else:
+      image_url = node.get("display_url") or node.get("thumbnail_src", "")
+      if image_url:
+        return {"type": "image", "url": image_url}
+    return None
+
+  def _parse_og_meta(self, html):
+    media = {}
+    video_match = re.search(
+        r'<meta\s+property=["\']og:video["\']\s+content=["\'](.*?)["\']',
+        html,
+        re.IGNORECASE,
+    )
+    if video_match:
+      media["type"] = "video"
+      media["url"] = unescape(video_match.group(1))
+      thumb_match = re.search(
+          r'<meta\s+property=["\']og:image["\']\s+content=["\'](.*?)["\']',
+          html,
+          re.IGNORECASE,
+      )
+      if thumb_match:
+        media["thumbnail"] = unescape(thumb_match.group(1))
+    else:
+      image_match = re.search(
+          r'<meta\s+property=["\']og:image["\']\s+content=["\'](.*?)["\']',
+          html,
+          re.IGNORECASE,
+      )
+      if image_match:
+        media["type"] = "image"
+        media["url"] = unescape(image_match.group(1))
+    return media if media.get("url") else None
+
+
+# ======================= دانلودر عمومی شبکه‌های اجتماعی =======================
 
 
 def download_file(url, path, headers=None):
@@ -294,7 +425,6 @@ def download_file(url, path, headers=None):
 
 
 def collect_files(workdir):
-  """فایل‌های دانلودشده را به صورت [(kind, path)] برمی‌گرداند."""
   items = []
   for p in sorted(glob.glob(os.path.join(workdir, "**", "*"), recursive=True)):
     if not os.path.isfile(p) or os.path.getsize(p) == 0:
@@ -307,12 +437,17 @@ def collect_files(workdir):
   return items[:10]
 
 
-def ext_from_url(url, default):
-  path = url.split("?")[0].lower()
-  for e in IMAGE_EXT + VIDEO_EXT:
-    if path.endswith(e):
-      return e
-  return default
+# ---------- اینستاگرام با کلاس اختصاصی ----------
+def instagram_custom_media(url, workdir):
+  downloader = InstagramDownloader()
+  media_info = downloader.download(url)
+  m_url = media_info.get("url")
+  m_type = "video" if media_info.get("type") == "video" else "photo"
+
+  ext = ".mp4" if m_type == "video" else ".jpg"
+  path = os.path.join(workdir, f"ig_media{ext}")
+  download_file(m_url, path)
+  return [(m_type, path)], None
 
 
 # ---------- توییتر / X ----------
@@ -326,8 +461,6 @@ def twitter_media(url, workdir):
 
   media = []
   caption = None
-
-  # روش ۱: fxtwitter
   try:
     r = requests.get(
         f"https://api.fxtwitter.com/status/{tid}", headers=HEADERS, timeout=20
@@ -339,15 +472,9 @@ def twitter_media(url, workdir):
       kind = "photo" if it.get("type") == "photo" else "video"
       if it.get("url"):
         media.append((kind, it["url"]))
-    if not media:
-      for it in md.get("photos") or []:
-        media.append(("photo", it["url"]))
-      for it in md.get("videos") or []:
-        media.append(("video", it["url"]))
-  except Exception as e:
-    print("fxtwitter failed:", e)
+  except Exception:
+    pass
 
-  # روش ۲: vxtwitter
   if not media:
     try:
       r = requests.get(
@@ -361,22 +488,22 @@ def twitter_media(url, workdir):
         kind = "photo" if it.get("type") == "image" else "video"
         if it.get("url"):
           media.append((kind, it["url"]))
-    except Exception as e:
-      print("vxtwitter failed:", e)
+    except Exception:
+      pass
 
   if not media:
     raise Exception("no media from twitter apis")
 
   items = []
   for i, (kind, murl) in enumerate(media[:10]):
-    ext = ext_from_url(murl, ".jpg" if kind == "photo" else ".mp4")
+    ext = ".jpg" if kind == "photo" else ".mp4"
     path = os.path.join(workdir, f"tw_{i}{ext}")
     download_file(murl, path)
     items.append((kind, path))
   return items, caption
 
 
-# ---------- yt-dlp ----------
+# ---------- yt-dlp برای یوتیوب و سایرین ----------
 def ytdlp_media(url, workdir):
   opts = {
       "noplaylist": True,
@@ -387,9 +514,6 @@ def ytdlp_media(url, workdir):
       "merge_output_format": "mp4",
       "http_headers": HEADERS,
   }
-  if "instagram.com" in url and os.path.exists("cookies.txt"):
-    opts["cookiefile"] = "cookies.txt"
-
   with yt_dlp.YoutubeDL(opts) as ydl:
     info = ydl.extract_info(url, download=True)
   if info and "entries" in info:
@@ -403,59 +527,11 @@ def ytdlp_media(url, workdir):
   return items, caption
 
 
-# ---------- gallery-dl (مخصوص عکس) ----------
-def gallerydl_media(url, workdir):
-  cmd = ["gallery-dl", "-D", workdir, "--no-mtime"]
-  if os.path.exists("cookies.txt"):
-    cmd += ["--cookies", "cookies.txt"]
-  cmd.append(url)
-  p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-  items = collect_files(workdir)
-  if not items:
-    raise Exception(f"gallery-dl failed: {p.stderr[-200:]}")
-  return items, None
-
-
-# ---------- اینستاگرام embed (بدون لاگین، برای پست‌های عمومی) ----------
-def instagram_embed_media(url, workdir):
-  m = re.search(
-      r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url
-  )
-  if not m:
-    raise Exception("instagram shortcode not found")
-  code = m.group(1)
-  r = requests.get(
-      f"https://www.instagram.com/p/{code}/embed/captioned/",
-      headers=HEADERS,
-      timeout=20,
-  )
-  r.raise_for_status()
-  imgs = re.findall(r'class="EmbeddedMediaImage"[^>]*src="([^"]+)"', r.text)
-  if not imgs:
-    imgs = re.findall(r'src="([^"]+)"[^>]*class="EmbeddedMediaImage"', r.text)
-  if not imgs:
-    raise Exception("no image in embed page")
-
-  items = []
-  for i, img in enumerate(imgs[:10]):
-    img = html.unescape(img)
-    path = os.path.join(workdir, f"ig_{i}.jpg")
-    download_file(img, path)
-    items.append(("photo", path))
-
-  caption = None
-  cm = re.search(r'class="Caption"[^>]*>(.*?)</div>', r.text, re.S)
-  if cm:
-    caption = html.unescape(re.sub(r"<[^>]+>", " ", cm.group(1))).strip()
-  return items, caption
-
-
 def fetch_media(url, workdir):
-  """چند روش را به ترتیب امتحان می‌کند تا یکی جواب بدهد."""
-  if re.search(r"(?:twitter|x)\.com/", url):
-    steps = [twitter_media, ytdlp_media, gallerydl_media]
-  elif "instagram.com" in url:
-    steps = [ytdlp_media, gallerydl_media, instagram_embed_media]
+  if "instagram.com" in url:
+    steps = [instagram_custom_media, ytdlp_media]
+  elif re.search(r"(?:twitter|x)\.com/", url):
+    steps = [twitter_media, ytdlp_media]
   else:
     steps = [ytdlp_media]
 
@@ -467,11 +543,9 @@ def fetch_media(url, workdir):
           os.remove(f)
       items, caption = step(url, workdir)
       if items:
-        print(f"OK via {step.__name__}")
         return items, caption
     except Exception as e:
       last_error = e
-      print(f"{step.__name__} failed: {e}")
   raise Exception(last_error or "all methods failed")
 
 
@@ -496,8 +570,7 @@ def send_items(chat_id, items, reply_to, markup):
             reply_markup=mk,
             timeout=120,
         )
-      except Exception as e:
-        print("send failed, trying as document:", e)
+      except Exception:
         f.seek(0)
         return bot.send_document(
             chat_id,
@@ -512,7 +585,6 @@ def send_items(chat_id, items, reply_to, markup):
     send_single(items[0][0], items[0][1], markup)
     return
 
-  # آلبوم
   handles = []
   try:
     media = []
@@ -528,8 +600,7 @@ def send_items(chat_id, items, reply_to, markup):
         reply_to_message_id=sent[0].message_id,
         reply_markup=markup,
     )
-  except Exception as e:
-    print("media group failed, sending one by one:", e)
+  except Exception:
     for kind, path in items:
       send_single(kind, path, None)
     bot.send_message(chat_id, "📋", reply_markup=markup)
@@ -590,7 +661,7 @@ def handle_social_links(message):
     delete_messages(chat_id, processing_msg.message_id)
 
   except Exception as e:
-    print(f"CRITICAL ERROR in handle_social_links: {e}")
+    print(f"CRITICAL ERROR: {e}")
     try:
       bot.edit_message_text(
           "❌ دانلود از این لینک انجام نشد. (پست خصوصی است یا حذف شده)",
