@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import threading
 import time
@@ -410,7 +409,7 @@ class InstagramDownloader:
     return media if media.get("url") else None
 
 
-# ======================= دانلودر عمومی شبکه‌های اجتماعی =======================
+# ======================= توابع کمکی دانلود =======================
 
 
 def download_file(url, path, headers=None):
@@ -437,7 +436,7 @@ def collect_files(workdir):
   return items[:10]
 
 
-# ---------- اینستاگرام با کلاس اختصاصی ----------
+# ---------- اجرای کلاس اینستاگرام ----------
 def instagram_custom_media(url, workdir):
   downloader = InstagramDownloader()
   media_info = downloader.download(url)
@@ -448,59 +447,6 @@ def instagram_custom_media(url, workdir):
   path = os.path.join(workdir, f"ig_media{ext}")
   download_file(m_url, path)
   return [(m_type, path)], None
-
-
-# ---------- توییتر / X ----------
-def twitter_media(url, workdir):
-  m = re.search(r"(?:twitter|x)\.com/[^/]+/status(?:es)?/(\d+)", url)
-  if not m:
-    m = re.search(r"(?:twitter|x)\.com/i/(?:web/)?status/(\d+)", url)
-  if not m:
-    raise Exception("tweet id not found")
-  tid = m.group(1)
-
-  media = []
-  caption = None
-  try:
-    r = requests.get(
-        f"https://api.fxtwitter.com/status/{tid}", headers=HEADERS, timeout=20
-    )
-    data = r.json().get("tweet") or {}
-    caption = data.get("text")
-    md = data.get("media") or {}
-    for it in md.get("all") or []:
-      kind = "photo" if it.get("type") == "photo" else "video"
-      if it.get("url"):
-        media.append((kind, it["url"]))
-  except Exception:
-    pass
-
-  if not media:
-    try:
-      r = requests.get(
-          f"https://api.vxtwitter.com/Twitter/status/{tid}",
-          headers=HEADERS,
-          timeout=20,
-      )
-      data = r.json()
-      caption = caption or data.get("text")
-      for it in data.get("media_extended") or []:
-        kind = "photo" if it.get("type") == "image" else "video"
-        if it.get("url"):
-          media.append((kind, it["url"]))
-    except Exception:
-      pass
-
-  if not media:
-    raise Exception("no media from twitter apis")
-
-  items = []
-  for i, (kind, murl) in enumerate(media[:10]):
-    ext = ".jpg" if kind == "photo" else ".mp4"
-    path = os.path.join(workdir, f"tw_{i}{ext}")
-    download_file(murl, path)
-    items.append((kind, path))
-  return items, caption
 
 
 # ---------- yt-dlp برای یوتیوب و سایرین ----------
@@ -530,8 +476,6 @@ def ytdlp_media(url, workdir):
 def fetch_media(url, workdir):
   if "instagram.com" in url:
     steps = [instagram_custom_media, ytdlp_media]
-  elif re.search(r"(?:twitter|x)\.com/", url):
-    steps = [twitter_media, ytdlp_media]
   else:
     steps = [ytdlp_media]
 
@@ -609,13 +553,7 @@ def send_items(chat_id, items, reply_to, markup):
       fh.close()
 
 
-SOCIAL_DOMAINS = [
-    "instagram.com",
-    "twitter.com",
-    "x.com",
-    "youtube.com",
-    "youtu.be",
-]
+SOCIAL_DOMAINS = ["instagram.com", "youtube.com", "youtu.be"]
 
 
 @bot.message_handler(
