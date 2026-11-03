@@ -22,8 +22,8 @@ from telebot.types import (
     ReactionTypeEmoji,
 )
 
-# توکن از متغیر محیطی خوانده می‌شود:  export BOT_TOKEN="xxxx"
-TOKEN = os.environ.get("9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY")
+# توکن ربات
+TOKEN = "9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY"
 
 ADMIN_IDS = [
     7904239647,
@@ -281,6 +281,7 @@ def process_caption(message):
 
 # ======================= دانلودر شبکه‌های اجتماعی =======================
 
+
 def download_file(url, path, headers=None):
   with requests.get(
       url, headers=headers or HEADERS, stream=True, timeout=40
@@ -323,7 +324,7 @@ def twitter_media(url, workdir):
     raise Exception("tweet id not found")
   tid = m.group(1)
 
-  media = []  # [(kind, url)]
+  media = []
   caption = None
 
   # روش ۱: fxtwitter
@@ -461,7 +462,6 @@ def fetch_media(url, workdir):
   last_error = None
   for step in steps:
     try:
-      # هر روش پوشه‌ی تمیز خودش را دارد
       for f in glob.glob(os.path.join(workdir, "*")):
         if os.path.isfile(f):
           os.remove(f)
@@ -481,19 +481,31 @@ def send_items(chat_id, items, reply_to, markup):
       try:
         if kind == "video":
           return bot.send_video(
-              chat_id, f, caption="✨✨", reply_to_message_id=reply_to,
-              reply_markup=mk, timeout=120,
+              chat_id,
+              f,
+              caption="✨✨",
+              reply_to_message_id=reply_to,
+              reply_markup=mk,
+              timeout=120,
           )
         return bot.send_photo(
-            chat_id, f, caption="✨✨", reply_to_message_id=reply_to,
-            reply_markup=mk, timeout=120,
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=mk,
+            timeout=120,
         )
       except Exception as e:
         print("send failed, trying as document:", e)
         f.seek(0)
         return bot.send_document(
-            chat_id, f, caption="✨✨", reply_to_message_id=reply_to,
-            reply_markup=mk, timeout=120,
+            chat_id,
+            f,
+            caption="✨✨",
+            reply_to_message_id=reply_to,
+            reply_markup=mk,
+            timeout=120,
         )
 
   if len(items) == 1:
@@ -511,7 +523,9 @@ def send_items(chat_id, items, reply_to, markup):
       media.append(cls(fh, caption="✨✨" if i == 0 else None))
     sent = bot.send_media_group(chat_id, media, reply_to_message_id=reply_to)
     bot.send_message(
-        chat_id, "📋", reply_to_message_id=sent[0].message_id,
+        chat_id,
+        "📋",
+        reply_to_message_id=sent[0].message_id,
         reply_markup=markup,
     )
   except Exception as e:
@@ -524,7 +538,13 @@ def send_items(chat_id, items, reply_to, markup):
       fh.close()
 
 
-SOCIAL_DOMAINS = ["instagram.com", "twitter.com", "x.com", "youtube.com", "youtu.be"]
+SOCIAL_DOMAINS = [
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+    "youtu.be",
+]
 
 
 @bot.message_handler(
