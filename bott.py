@@ -917,7 +917,7 @@ def handle_social_links(message):
     if not match:
         return
 
-    url = match.group(0).rstrip(".,!?)\]}>")
+    url = match.group(0).rstrip(".,!?)]}>")
 
     if "instagram.com" in url.lower():
         url = url.split("?")[0]
