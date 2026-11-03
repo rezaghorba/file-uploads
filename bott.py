@@ -298,41 +298,45 @@ def handle_social_links(message):
       reply_to_message_id=reply_to,
   )
 
-  try:
-    output_template = f"media_{chat_id}_{message_id}.%(ext)s"
-    ydl_opts = {
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "socket_timeout": 30,
-        "geo_bypass": True,
-        "quiet": True,
-        "no_warnings": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": "en-US,en;q=0.5",
-        },
-    }
+try:
+      output_template = f"media_{chat_id}_{message_id}.%(ext)s"
+      
+      # تنظیمات بهینه شده برای دانلود عکس و ویدیو از اینستاگرام و توییتر
+      ydl_opts = {
+          "outtmpl": output_template,
+          "noplaylist": True,
+          "socket_timeout": 30,
+          "geo_bypass": True,
+          "quiet": True,
+          "no_warnings": True,
+          "extract_flat": False,
+          "http_headers": {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.5",
+          }
+      }
 
-    if "instagram.com" in url and os.path.exists("cookies.txt"):
-      ydl_opts["cookiefile"] = "cookies.txt"
+      if "instagram.com" in url and os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-      info = ydl.extract_info(url, download=True)
-      filename = ydl.prepare_filename(info)
-      original_caption = info.get("description", "کپشنی موجود نیست.")
+      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # استخراج اطلاعات؛ برای پست‌های عکس، گاهی اطلاعات در entries قرار می‌گیرد
+        info = ydl.extract_info(url, download=True)
+        
+        if 'entries' in info:
+            # اگر آلبوم چندرسانه‌ای باشد، اولین آیتم را می‌گیریم
+            info = info['entries'][0]
+            
+        filename = ydl.prepare_filename(info)
+        original_caption = info.get("description", "کپشنی موجود نیست.")
 
-      if not os.path.exists(filename):
-        base_name = f"media_{chat_id}_{message_id}"
-        for file in os.listdir("."):
-          if file.startswith(base_name):
-            filename = file
-            break
+        if not os.path.exists(filename):
+          base_name = f"media_{chat_id}_{message_id}"
+          for file in os.listdir("."):
+            if file.startswith(base_name):
+              filename = file
+              break
 
     social_captions[filename] = original_caption
 
