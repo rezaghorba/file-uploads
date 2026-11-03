@@ -1,5 +1,0 @@
-pyTelegramBotAPI
-yt-dlp
-requests
-gallery-dl
-pillow
