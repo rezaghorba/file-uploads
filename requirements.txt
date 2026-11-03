@@ -1,3 +1,4 @@
 pyTelegramBotAPI
 yt-dlp
-aiofiles
+requests
+gallery-dl
