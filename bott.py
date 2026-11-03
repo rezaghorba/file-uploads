@@ -1,15 +1,29 @@
+import glob
+import html
 import json
 import os
+import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import time
+import uuid
+
 import requests
 import telebot
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReactionTypeEmoji
 import yt_dlp
+from telebot.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    ReactionTypeEmoji,
+)
 
-# توکن ربات
-TOKEN = "9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY"
+# توکن از متغیر محیطی خوانده می‌شود:  export BOT_TOKEN="xxxx"
+TOKEN = os.environ.get("9032432816:AAEPZiX2VV2D5ppXpxsUUCAE7yJjn1swrTY")
 
 ADMIN_IDS = [
     7904239647,
@@ -36,10 +50,8 @@ REQUIRED_CHANNELS = [
 
 bot = telebot.TeleBot(TOKEN)
 
-# راه‌اندازی دیتابیس
 conn = sqlite3.connect("bot_data.db", check_same_thread=False)
 cursor = conn.cursor()
-
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +65,15 @@ conn.commit()
 
 pending_files = {}
 social_captions = {}
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.5"}
+
+VIDEO_EXT = (".mp4", ".mkv", ".webm", ".mov", ".gif")
+IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".jfif")
 
 
 def delete_messages(chat_id, *message_ids):
@@ -76,7 +97,7 @@ def check_membership(user_id):
   return True
 
 
-# ۱. هندلر استارت و قفل چنل
+# ۱. استارت و قفل چنل
 @bot.message_handler(commands=["start"])
 def start_command(message):
   text = message.text.split()
@@ -172,7 +193,7 @@ def start_command(message):
       bot.reply_to(message, "❌ خطایی رخ داد.")
 
 
-# ۲. دریافت فایل از ادمین برای ساخت لینک (فقط در چت خصوصی)
+# ۲. دریافت فایل از ادمین
 @bot.message_handler(content_types=["document", "video", "audio", "photo"])
 def receive_file(message):
   if message.chat.type in ["group", "supergroup"]:
@@ -247,7 +268,6 @@ def process_caption(message):
   )
   conn.commit()
   short_id = cursor.lastrowid
-
   del pending_files[message.chat.id]
 
   bot_info = bot.get_me()
@@ -259,310 +279,314 @@ def process_caption(message):
   )
 
 
-# هندلر هوشمند لینک‌های شبکه‌های اجتماعی (متد استخراج هوشمند لینک مستقیم)
-@bot.message_handler(
-    func=lambda message: message.text
-    and any(
-        domain in message.text
-        for domain in [
-            "instagram.com",
-            "twitter.com",
-            "x.com",
-            "youtube.com",
-            "youtu.be",
-        ]
+# ======================= دانلودر شبکه‌های اجتماعی =======================
+
+def download_file(url, path, headers=None):
+  with requests.get(
+      url, headers=headers or HEADERS, stream=True, timeout=40
+  ) as r:
+    r.raise_for_status()
+    with open(path, "wb") as f:
+      for chunk in r.iter_content(chunk_size=65536):
+        if chunk:
+          f.write(chunk)
+
+
+def collect_files(workdir):
+  """فایل‌های دانلودشده را به صورت [(kind, path)] برمی‌گرداند."""
+  items = []
+  for p in sorted(glob.glob(os.path.join(workdir, "**", "*"), recursive=True)):
+    if not os.path.isfile(p) or os.path.getsize(p) == 0:
+      continue
+    low = p.lower()
+    if low.endswith(VIDEO_EXT):
+      items.append(("video", p))
+    elif low.endswith(IMAGE_EXT):
+      items.append(("photo", p))
+  return items[:10]
+
+
+def ext_from_url(url, default):
+  path = url.split("?")[0].lower()
+  for e in IMAGE_EXT + VIDEO_EXT:
+    if path.endswith(e):
+      return e
+  return default
+
+
+# ---------- توییتر / X ----------
+def twitter_media(url, workdir):
+  m = re.search(r"(?:twitter|x)\.com/[^/]+/status(?:es)?/(\d+)", url)
+  if not m:
+    m = re.search(r"(?:twitter|x)\.com/i/(?:web/)?status/(\d+)", url)
+  if not m:
+    raise Exception("tweet id not found")
+  tid = m.group(1)
+
+  media = []  # [(kind, url)]
+  caption = None
+
+  # روش ۱: fxtwitter
+  try:
+    r = requests.get(
+        f"https://api.fxtwitter.com/status/{tid}", headers=HEADERS, timeout=20
     )
+    data = r.json().get("tweet") or {}
+    caption = data.get("text")
+    md = data.get("media") or {}
+    for it in md.get("all") or []:
+      kind = "photo" if it.get("type") == "photo" else "video"
+      if it.get("url"):
+        media.append((kind, it["url"]))
+    if not media:
+      for it in md.get("photos") or []:
+        media.append(("photo", it["url"]))
+      for it in md.get("videos") or []:
+        media.append(("video", it["url"]))
+  except Exception as e:
+    print("fxtwitter failed:", e)
+
+  # روش ۲: vxtwitter
+  if not media:
+    try:
+      r = requests.get(
+          f"https://api.vxtwitter.com/Twitter/status/{tid}",
+          headers=HEADERS,
+          timeout=20,
+      )
+      data = r.json()
+      caption = caption or data.get("text")
+      for it in data.get("media_extended") or []:
+        kind = "photo" if it.get("type") == "image" else "video"
+        if it.get("url"):
+          media.append((kind, it["url"]))
+    except Exception as e:
+      print("vxtwitter failed:", e)
+
+  if not media:
+    raise Exception("no media from twitter apis")
+
+  items = []
+  for i, (kind, murl) in enumerate(media[:10]):
+    ext = ext_from_url(murl, ".jpg" if kind == "photo" else ".mp4")
+    path = os.path.join(workdir, f"tw_{i}{ext}")
+    download_file(murl, path)
+    items.append((kind, path))
+  return items, caption
+
+
+# ---------- yt-dlp ----------
+def ytdlp_media(url, workdir):
+  opts = {
+      "noplaylist": True,
+      "quiet": True,
+      "no_warnings": True,
+      "outtmpl": os.path.join(workdir, "%(id)s_%(autonumber)s.%(ext)s"),
+      "format": "best[ext=mp4][filesize<50M]/best[ext=mp4]/best",
+      "merge_output_format": "mp4",
+      "http_headers": HEADERS,
+  }
+  if "instagram.com" in url and os.path.exists("cookies.txt"):
+    opts["cookiefile"] = "cookies.txt"
+
+  with yt_dlp.YoutubeDL(opts) as ydl:
+    info = ydl.extract_info(url, download=True)
+  if info and "entries" in info:
+    entries = [e for e in info["entries"] if e]
+    info = entries[0] if entries else info
+  caption = info.get("description") if info else None
+
+  items = collect_files(workdir)
+  if not items:
+    raise Exception("yt-dlp downloaded nothing")
+  return items, caption
+
+
+# ---------- gallery-dl (مخصوص عکس) ----------
+def gallerydl_media(url, workdir):
+  cmd = ["gallery-dl", "-D", workdir, "--no-mtime"]
+  if os.path.exists("cookies.txt"):
+    cmd += ["--cookies", "cookies.txt"]
+  cmd.append(url)
+  p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+  items = collect_files(workdir)
+  if not items:
+    raise Exception(f"gallery-dl failed: {p.stderr[-200:]}")
+  return items, None
+
+
+# ---------- اینستاگرام embed (بدون لاگین، برای پست‌های عمومی) ----------
+def instagram_embed_media(url, workdir):
+  m = re.search(
+      r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url
+  )
+  if not m:
+    raise Exception("instagram shortcode not found")
+  code = m.group(1)
+  r = requests.get(
+      f"https://www.instagram.com/p/{code}/embed/captioned/",
+      headers=HEADERS,
+      timeout=20,
+  )
+  r.raise_for_status()
+  imgs = re.findall(r'class="EmbeddedMediaImage"[^>]*src="([^"]+)"', r.text)
+  if not imgs:
+    imgs = re.findall(r'src="([^"]+)"[^>]*class="EmbeddedMediaImage"', r.text)
+  if not imgs:
+    raise Exception("no image in embed page")
+
+  items = []
+  for i, img in enumerate(imgs[:10]):
+    img = html.unescape(img)
+    path = os.path.join(workdir, f"ig_{i}.jpg")
+    download_file(img, path)
+    items.append(("photo", path))
+
+  caption = None
+  cm = re.search(r'class="Caption"[^>]*>(.*?)</div>', r.text, re.S)
+  if cm:
+    caption = html.unescape(re.sub(r"<[^>]+>", " ", cm.group(1))).strip()
+  return items, caption
+
+
+def fetch_media(url, workdir):
+  """چند روش را به ترتیب امتحان می‌کند تا یکی جواب بدهد."""
+  if re.search(r"(?:twitter|x)\.com/", url):
+    steps = [twitter_media, ytdlp_media, gallerydl_media]
+  elif "instagram.com" in url:
+    steps = [ytdlp_media, gallerydl_media, instagram_embed_media]
+  else:
+    steps = [ytdlp_media]
+
+  last_error = None
+  for step in steps:
+    try:
+      # هر روش پوشه‌ی تمیز خودش را دارد
+      for f in glob.glob(os.path.join(workdir, "*")):
+        if os.path.isfile(f):
+          os.remove(f)
+      items, caption = step(url, workdir)
+      if items:
+        print(f"OK via {step.__name__}")
+        return items, caption
+    except Exception as e:
+      last_error = e
+      print(f"{step.__name__} failed: {e}")
+  raise Exception(last_error or "all methods failed")
+
+
+def send_items(chat_id, items, reply_to, markup):
+  def send_single(kind, path, mk):
+    with open(path, "rb") as f:
+      try:
+        if kind == "video":
+          return bot.send_video(
+              chat_id, f, caption="✨✨", reply_to_message_id=reply_to,
+              reply_markup=mk, timeout=120,
+          )
+        return bot.send_photo(
+            chat_id, f, caption="✨✨", reply_to_message_id=reply_to,
+            reply_markup=mk, timeout=120,
+        )
+      except Exception as e:
+        print("send failed, trying as document:", e)
+        f.seek(0)
+        return bot.send_document(
+            chat_id, f, caption="✨✨", reply_to_message_id=reply_to,
+            reply_markup=mk, timeout=120,
+        )
+
+  if len(items) == 1:
+    send_single(items[0][0], items[0][1], markup)
+    return
+
+  # آلبوم
+  handles = []
+  try:
+    media = []
+    for i, (kind, path) in enumerate(items):
+      fh = open(path, "rb")
+      handles.append(fh)
+      cls = InputMediaVideo if kind == "video" else InputMediaPhoto
+      media.append(cls(fh, caption="✨✨" if i == 0 else None))
+    sent = bot.send_media_group(chat_id, media, reply_to_message_id=reply_to)
+    bot.send_message(
+        chat_id, "📋", reply_to_message_id=sent[0].message_id,
+        reply_markup=markup,
+    )
+  except Exception as e:
+    print("media group failed, sending one by one:", e)
+    for kind, path in items:
+      send_single(kind, path, None)
+    bot.send_message(chat_id, "📋", reply_markup=markup)
+  finally:
+    for fh in handles:
+      fh.close()
+
+
+SOCIAL_DOMAINS = ["instagram.com", "twitter.com", "x.com", "youtube.com", "youtu.be"]
+
+
+@bot.message_handler(
+    func=lambda m: m.text and any(d in m.text for d in SOCIAL_DOMAINS)
 )
 def handle_social_links(message):
-  url = message.text.strip()
-  print(f"DEBUG: Received URL -> {url}")
-
+  m = re.search(r"https?://\S+", message.text)
+  if not m:
+    return
+  url = m.group(0).strip()
   if "instagram.com" in url:
     url = url.split("?")[0]
 
   chat_id = message.chat.id
   message_id = message.message_id
   is_group = message.chat.type in ["group", "supergroup"]
+  reply_to = message_id if is_group else None
 
   if is_group:
     try:
-      bot.set_message_reaction(
-          chat_id, message_id, [ReactionTypeEmoji("👀")]
-      )
+      bot.set_message_reaction(chat_id, message_id, [ReactionTypeEmoji("👀")])
     except Exception:
       pass
 
-  reply_to = message_id if is_group else None
   processing_msg = bot.send_message(
       chat_id,
       "⏳ در حال پردازش و استخراج رسانه...",
       reply_to_message_id=reply_to,
   )
 
+  workdir = tempfile.mkdtemp(prefix="dl_")
   try:
-    ydl_opts = {
-        "noplaylist": True,
-        "quiet": False,  # موقتاً برای دیدن جزئیات در لاگ
-        "no_warnings": False,
-        "skip_download": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": "en-US,en;q=0.5",
-        },
-    }
+    items, caption = fetch_media(url, workdir)
 
-    if "instagram.com" in url and os.path.exists("cookies.txt"):
-      ydl_opts["cookiefile"] = "cookies.txt"
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-      info = ydl.extract_info(url, download=False)
-      if "entries" in info:
-        info = info["entries"][0]
-
-      print(f"DEBUG: Extracted info keys -> {list(info.keys())}")
-      original_caption = info.get("description", "کپشنی موجود نیست.")
-
-      media_url = info.get("url")
-      if not media_url and "formats" in info and info["formats"]:
-        media_url = info["formats"][-1].get("url")
-      if not media_url:
-        media_url = info.get("thumbnail")
-
-      print(f"DEBUG: Resolved media_url -> {media_url}")
-
-      if not media_url:
-        raise Exception("Media URL not found in extracted info")
-
-      ext = "jpg"
-      if any(
-          img_ext in media_url.lower() for img_ext in [".jpg", ".png", ".webp"]
-      ):
-        ext = "jpg"
-      elif info.get("ext") in ["mp4", "mkv", "webm", "mov"]:
-        ext = info.get("ext")
-
-      filename = f"media_{chat_id}_{message_id}.{ext}"
-
-      res = requests.get(
-          media_url,
-          headers={
-              "User-Agent": (
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-              )
-          },
-          stream=True,
-          timeout=30,
-      )
-      print(f"DEBUG: Requests status code -> {res.status_code}")
-
-      if res.status_code == 200:
-        with open(filename, "wb") as f:
-          for chunk in res.iter_content(chunk_size=8192):
-            f.write(chunk)
-      else:
-        raise Exception(f"Failed to download, status code: {res.status_code}")
-
-    social_captions[filename] = original_caption
-
+    key = uuid.uuid4().hex[:12]
+    social_captions[key] = caption or "کپشنی موجود نیست."
     markup = InlineKeyboardMarkup()
     markup.row(
-        InlineKeyboardButton(
-            "مشاهده کپشن 📋", callback_data=f"show_cap_{filename}"
-        )
+        InlineKeyboardButton("مشاهده کپشن 📋", callback_data=f"cap_{key}")
     )
 
-    with open(filename, "rb") as f:
-      if filename.endswith((".mp4", ".mkv", ".webm", ".mov", ".gif")):
-        bot.send_video(
-            chat_id,
-            f,
-            caption="✨✨",
-            reply_to_message_id=reply_to,
-            reply_markup=markup,
-        )
-      elif filename.endswith(
-          (".jpg", ".jpeg", ".png", ".webp", ".jfif", ".heic")
-      ):
-        bot.send_photo(
-            chat_id,
-            f,
-            caption="✨✨",
-            reply_to_message_id=reply_to,
-            reply_markup=markup,
-        )
-      else:
-        bot.send_document(
-            chat_id,
-            f,
-            caption="✨✨",
-            reply_to_message_id=reply_to,
-            reply_markup=markup,
-        )
-
-    if os.path.exists(filename):
-      os.remove(filename)
-
-    bot.delete_message(chat_id, processing_msg.message_id)
+    send_items(chat_id, items, reply_to, markup)
+    delete_messages(chat_id, processing_msg.message_id)
 
   except Exception as e:
     print(f"CRITICAL ERROR in handle_social_links: {e}")
     try:
       bot.edit_message_text(
-          f"❌ خطا در پردازش: {str(e)[:100]}",
+          "❌ دانلود از این لینک انجام نشد. (پست خصوصی است یا حذف شده)",
           chat_id,
           processing_msg.message_id,
       )
-    except:
+    except Exception:
       pass
-  reply_to = message_id if is_group else None
-  processing_msg = bot.send_message(
-      chat_id,
-      "⏳ در حال پردازش و استخراج رسانه...",
-      reply_to_message_id=reply_to,
-  )
-
-  try:
-    ydl_opts = {
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,  # عدم دانلود مستقیم توسط yt-dlp برای جلوگیری از خطا
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                " (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": "en-US,en;q=0.5",
-        },
-    }
-
-    if "instagram.com" in url and os.path.exists("cookies.txt"):
-      ydl_opts["cookiefile"] = "cookies.txt"
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-      info = ydl.extract_info(url, download=False)
-      if "entries" in info:
-        info = info["entries"][0]
-
-      original_caption = info.get("description", "کپشنی موجود نیست.")
-
-      # استخراج لینک مستقیم رسانه (چه عکس، چه ویدیو)
-      media_url = info.get("url")
-      if not media_url and "formats" in info and info["formats"]:
-        # انتخاب بهترین فرمت موجود
-        media_url = info["formats"][-1].get("url")
-      if not media_url:
-        media_url = info.get("thumbnail")
-
-      if not media_url:
-        raise Exception("Media URL not found")
-
-      # تشخیص پسوند فایل بر اساس لینک یا نوع محتوا
-      ext = "mp4"
-      if info.get("ext") in [
-          "jpg",
-          "jpeg",
-          "png",
-          "webp",
-          "jfif",
-          "heic",
-      ] or any(
-          img_ext in media_url.lower() for img_ext in [".jpg", ".png", ".webp"]
-      ):
-        ext = "jpg"
-      elif info.get("ext"):
-        ext = info.get("ext")
-
-      filename = f"media_{chat_id}_{message_id}.{ext}"
-
-      # دانلود فایل با استفاده از requests به صورت امن
-      res = requests.get(
-          media_url,
-          headers={
-              "User-Agent": (
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-              )
-          },
-          stream=True,
-          timeout=30,
-      )
-      if res.status_code == 200:
-        with open(filename, "wb") as f:
-          for chunk in res.iter_content(chunk_size=8192):
-            f.write(chunk)
-      else:
-        raise Exception("Failed to download media content")
-
-    social_captions[filename] = original_caption
-
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton(
-            "مشاهده کپشن 📋", callback_data=f"show_cap_{filename}"
-        )
-    )
-
-    with open(filename, "rb") as f:
-      if filename.endswith((".mp4", ".mkv", ".webm", ".mov", ".gif")):
-        bot.send_video(
-            chat_id,
-            f,
-            caption="✨✨",
-            reply_to_message_id=reply_to,
-            reply_markup=markup,
-        )
-      elif filename.endswith(
-          (".jpg", ".jpeg", ".png", ".webp", ".jfif", ".heic")
-      ):
-        bot.send_photo(
-            chat_id,
-            f,
-            caption="✨✨",
-            reply_to_message_id=reply_to,
-            reply_markup=markup,
-        )
-      else:
-        bot.send_document(
-            chat_id,
-            f,
-            caption="✨✨",
-            reply_to_message_id=reply_to,
-            reply_markup=markup,
-        )
-
-    if os.path.exists(filename):
-      os.remove(filename)
-
-    bot.delete_message(chat_id, processing_msg.message_id)
-
-  except Exception as e:
-    print(f"Error: {e}")
-    try:
-      bot.edit_message_text(
-          "❌ دانلود از این لینک با خطا مواجه شد.",
-          chat_id,
-          processing_msg.message_id,
-      )
-    except:
-      pass
+  finally:
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
-# هندلر نمایش کپشن
-@bot.callback_query_handler(func=lambda call: call.data.startswith("show_cap_"))
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cap_"))
 def callback_show_caption(call):
-  filename_key = call.data.replace("show_cap_", "")
-  caption = social_captions.get(
-      filename_key, "کپشن این پست یافت نشد یا منقضی شده است."
-  )
+  key = call.data[4:]
+  caption = social_captions.get(key, "کپشن این پست یافت نشد یا منقضی شده است.")
   bot.answer_callback_query(call.id, text=caption[:200], show_alert=True)
 
 
